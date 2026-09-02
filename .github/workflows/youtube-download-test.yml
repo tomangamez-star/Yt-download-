@@ -1,1 +1,99 @@
+name: YouTube Download Test
 
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Public YouTube video URL to test"
+        required: true
+        type: string
+      quality:
+        description: "Maximum video height"
+        required: true
+        default: "360"
+        type: choice
+        options:
+          - "360"
+          - "720"
+          - "1080"
+
+permissions:
+  contents: read
+
+jobs:
+  download-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install yt-dlp and FFmpeg
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade "yt-dlp[default]"
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          echo "yt-dlp version: $(yt-dlp --version)"
+          echo "Node version: $(node --version)"
+          echo "FFmpeg version: $(ffmpeg -version | head -n 1)"
+
+      - name: Test YouTube extraction and download
+        shell: bash
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          QUALITY: ${{ inputs.quality }}
+        run: |
+          set -o pipefail
+          mkdir -p output
+
+          echo "============================================================"
+          echo "TubeGrab GitHub Actions network test"
+          echo "Quality cap: ${QUALITY}p"
+          echo "No cookies are being used in this test."
+          echo "============================================================"
+
+          yt-dlp \
+            --verbose \
+            --no-playlist \
+            --newline \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --merge-output-format mp4 \
+            --format "bv*[height<=${QUALITY}]+ba/b[height<=${QUALITY}]/best[height<=${QUALITY}]/best" \
+            --output "output/%(title).120B [%(id)s].%(ext)s" \
+            "$VIDEO_URL" 2>&1 | tee yt-dlp-test.log
+
+      - name: Show downloaded files
+        if: always()
+        shell: bash
+        run: |
+          echo "Files in output:"
+          find output -maxdepth 1 -type f -printf '%f (%s bytes)\n' 2>/dev/null || true
+
+      - name: Upload yt-dlp diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yt-dlp-test-log
+          path: yt-dlp-test.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Upload downloaded video
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tubegrab-test-video
+          path: output/*
+          if-no-files-found: error
+          retention-days: 1
