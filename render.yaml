@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: tubegrab
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "2"
+      - key: MAX_VIDEO_DURATION_SEC
+        value: "7200"
+      - key: MAX_FILE_MB
+        value: "750"
+      - key: JOB_TTL_MINUTES
+        value: "20"
+      - key: API_RATE_LIMIT_PER_MINUTE
+        value: "30"
+      - key: DOWNLOAD_RATE_LIMIT_PER_10_MIN
+        value: "8"
