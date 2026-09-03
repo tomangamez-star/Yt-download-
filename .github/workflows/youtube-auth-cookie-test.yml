@@ -1,0 +1,167 @@
+name: YouTube Authenticated Cookie Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Short public YouTube URL to test'
+        required: true
+        type: string
+      quality:
+        description: 'Maximum video height'
+        required: true
+        default: '360'
+        type: choice
+        options:
+          - '360'
+
+permissions:
+  contents: read
+
+jobs:
+  authenticated-download-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install yt-dlp and FFmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade 'yt-dlp[default]'
+          echo "yt-dlp: $(yt-dlp --version)"
+          echo "Node: $(node --version)"
+          ffmpeg -version | head -n 1
+
+      - name: Create private writable cookie jar
+        id: cookies
+        shell: bash
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${YOUTUBE_COOKIES:-}" ]; then
+            echo 'ERROR: GitHub Actions secret YOUTUBE_COOKIES is missing or empty.' >&2
+            echo 'Create it in repository Settings -> Secrets and variables -> Actions -> New repository secret.' >&2
+            exit 1
+          fi
+
+          COOKIE_FILE="$RUNNER_TEMP/tubegrab-youtube-cookies.txt"
+          printf '%s\n' "$YOUTUBE_COOKIES" > "$COOKIE_FILE"
+          chmod 600 "$COOKIE_FILE"
+
+          # Validate structure without printing any cookie values.
+          if ! head -n 2 "$COOKIE_FILE" | grep -qiE 'Netscape HTTP Cookie File|HTTP Cookie File'; then
+            echo 'WARNING: Cookie secret does not appear to start with a Netscape cookies.txt header.' >&2
+          fi
+
+          COOKIE_BYTES=$(wc -c < "$COOKIE_FILE" | tr -d ' ')
+          COOKIE_LINES=$(wc -l < "$COOKIE_FILE" | tr -d ' ')
+          echo "Cookie jar created privately: ${COOKIE_BYTES} bytes / ${COOKIE_LINES} lines"
+          echo "cookie_file=$COOKIE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Run one authenticated YouTube test
+        id: test
+        continue-on-error: true
+        shell: bash
+        env:
+          TEST_URL: ${{ inputs.url }}
+          MAX_HEIGHT: ${{ inputs.quality }}
+          COOKIE_FILE: ${{ steps.cookies.outputs.cookie_file }}
+        run: |
+          set -o pipefail
+          mkdir -p output
+
+          echo '============================================================'
+          echo 'TubeGrab GitHub Actions authenticated-cookie test'
+          echo "Quality cap: ${MAX_HEIGHT}p"
+          echo 'Cookies: ENABLED (values will not be printed)'
+          echo 'PO-token provider: NONE for this isolated test'
+          echo 'Tailscale/mobile exit node: NONE'
+          echo '============================================================'
+
+          yt-dlp \
+            --verbose \
+            --no-playlist \
+            --newline \
+            --cookies "$COOKIE_FILE" \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --match-filter 'duration <= 90' \
+            --max-filesize 12M \
+            --merge-output-format mp4 \
+            --format "bv*[height<=${MAX_HEIGHT}]+ba/b[height<=${MAX_HEIGHT}]/best[height<=${MAX_HEIGHT}]/best" \
+            --output 'output/%(title).120B [%(id)s].%(ext)s' \
+            "$TEST_URL" 2>&1 | tee yt-dlp-auth-cookie.log
+
+      - name: Remove authenticated cookie jar
+        if: always()
+        shell: bash
+        env:
+          COOKIE_FILE: ${{ steps.cookies.outputs.cookie_file }}
+        run: |
+          set +e
+          if [ -n "${COOKIE_FILE:-}" ] && [ -f "$COOKIE_FILE" ]; then
+            if command -v shred >/dev/null 2>&1; then
+              shred -u "$COOKIE_FILE" || rm -f "$COOKIE_FILE"
+            else
+              rm -f "$COOKIE_FILE"
+            fi
+          fi
+          unset YOUTUBE_COOKIES
+          echo 'Temporary authenticated cookie jar removed.'
+
+      - name: Summarize result
+        if: always()
+        shell: bash
+        run: |
+          echo '============================================================'
+          if find output -maxdepth 1 -type f -size +0c -print -quit 2>/dev/null | grep -q .; then
+            echo 'Authenticated YouTube download: SUCCESS ✅'
+            find output -maxdepth 1 -type f -printf '%f | %s bytes\n'
+          else
+            echo 'Authenticated YouTube download: FAILED ❌'
+            if grep -qi "Sign in to confirm you.re not a bot\|LOGIN_REQUIRED" yt-dlp-auth-cookie.log 2>/dev/null; then
+              echo 'Result: YouTube still rejected/challenged the cloud session/IP.'
+            elif grep -qi 'confirm your age' yt-dlp-auth-cookie.log 2>/dev/null; then
+              echo 'Result: Account/session did not satisfy the age gate for this video.'
+            fi
+          fi
+          echo '============================================================'
+
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yt-dlp-auth-cookie-log
+          path: yt-dlp-auth-cookie.log
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload test video if successful
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tubegrab-auth-cookie-test-video
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Fail workflow if download failed
+        if: steps.test.outcome == 'failure'
+        shell: bash
+        run: exit 1
