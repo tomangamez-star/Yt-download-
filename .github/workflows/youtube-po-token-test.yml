@@ -1,0 +1,142 @@
+name: YouTube PO Token Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Public YouTube URL to test (use a short video)'
+        required: true
+        type: string
+      quality:
+        description: 'Maximum video height'
+        required: true
+        default: '360'
+        type: choice
+        options:
+          - '360'
+
+permissions:
+  contents: read
+
+jobs:
+  po-token-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install FFmpeg, yt-dlp, and PO-token plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade 'yt-dlp[default]' bgutil-ytdlp-pot-provider
+          yt-dlp --version
+          ffmpeg -version | head -n 1
+          node --version
+
+      - name: Build BGUtil token generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROVIDER_ROOT="$RUNNER_TEMP/bgutil-ytdlp-pot-provider"
+          git clone --depth 1 --branch 1.3.2 \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+            "$PROVIDER_ROOT"
+          cd "$PROVIDER_ROOT/server"
+          npm ci
+          npx tsc
+          test -f build/main.js
+          echo "BGUTIL_SERVER_HOME=$PROVIDER_ROOT/server" >> "$GITHUB_ENV"
+
+      - name: Run one PO-token YouTube test
+        id: test
+        continue-on-error: true
+        shell: bash
+        env:
+          TEST_URL: ${{ inputs.url }}
+          MAX_HEIGHT: ${{ inputs.quality }}
+        run: |
+          set -o pipefail
+          mkdir -p output
+
+          echo '============================================================'
+          echo 'TubeGrab GitHub Actions PO-token test'
+          echo "Quality cap: ${MAX_HEIGHT}p"
+          echo 'Cookies: NONE'
+          echo 'Tailscale/mobile exit node: NONE'
+          echo "BGUtil server home: $BGUTIL_SERVER_HOME"
+          echo '============================================================'
+
+          yt-dlp \
+            --verbose \
+            --no-playlist \
+            --newline \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --extractor-args 'youtube:player_client=mweb' \
+            --extractor-args "youtubepot-bgutilscript:server_home=${BGUTIL_SERVER_HOME}" \
+            --match-filter 'duration <= 90' \
+            --max-filesize 12M \
+            --merge-output-format mp4 \
+            --format "bv*[height<=${MAX_HEIGHT}]+ba/b[height<=${MAX_HEIGHT}]/best[height<=${MAX_HEIGHT}]/best" \
+            --output 'output/%(title).120B [%(id)s].%(ext)s' \
+            "$TEST_URL" 2>&1 | tee yt-dlp-po-token.log
+
+      - name: Summarize result
+        if: always()
+        shell: bash
+        run: |
+          echo '============================================================'
+          if grep -q 'PO Token Providers:.*bgutil' yt-dlp-po-token.log 2>/dev/null; then
+            echo 'PO-token provider detection: YES ✅'
+            grep 'PO Token Providers:' yt-dlp-po-token.log | tail -n 1 || true
+          else
+            echo 'PO-token provider detection: NO ❌'
+            grep 'PO Token Providers:' yt-dlp-po-token.log | tail -n 1 || true
+          fi
+
+          if find output -type f -size +0c -print -quit 2>/dev/null | grep -q .; then
+            echo 'YouTube download result: SUCCESS ✅'
+            find output -type f -maxdepth 1 -printf '%f | %s bytes\n'
+          else
+            echo 'YouTube download result: FAILED ❌'
+          fi
+          echo '============================================================'
+
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yt-dlp-po-token-log
+          path: yt-dlp-po-token.log
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload test video if successful
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tubegrab-po-token-test-video
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Fail workflow if download failed
+        if: steps.test.outcome == 'failure'
+        shell: bash
+        run: exit 1
