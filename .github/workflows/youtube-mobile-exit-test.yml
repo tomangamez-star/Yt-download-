@@ -1,0 +1,134 @@
+name: YouTube Mobile Exit Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Short public YouTube URL (90 sec max)"
+        required: true
+        type: string
+      exit_node:
+        description: "Tailscale exit-node machine name or Tailscale IP"
+        required: true
+        default: "tecno-spark-30c"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  mobile-exit-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Record GitHub runner public IP
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GitHub runner public IP before Tailscale:"
+          curl -4 --fail --silent --show-error https://api.ipify.org
+          echo
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+
+      - name: Route internet through phone exit node
+        shell: bash
+        env:
+          EXIT_NODE: ${{ inputs.exit_node }}
+        run: |
+          set -euo pipefail
+          echo "Tailnet status before selecting exit node:"
+          tailscale status
+          echo
+          echo "Selecting exit node: ${EXIT_NODE}"
+          sudo tailscale set --exit-node="${EXIT_NODE}" --exit-node-allow-lan-access=true
+          sleep 5
+          echo
+          echo "Tailnet status after selecting exit node:"
+          tailscale status
+          echo
+          echo "Public IP after exit-node routing:"
+          curl -4 --fail --silent --show-error https://api.ipify.org | tee mobile-exit-public-ip.txt
+          echo
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install yt-dlp and FFmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade "yt-dlp[default]"
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          echo "yt-dlp: $(yt-dlp --version)"
+          echo "Node: $(node --version)"
+          echo "FFmpeg: $(ffmpeg -version | head -n 1)"
+
+      - name: Test one tiny 360p download over mobile exit node
+        shell: bash
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          set -o pipefail
+          mkdir -p output
+
+          echo "============================================================"
+          echo "TubeGrab mobile/residential exit-node test"
+          echo "One video only • 360p max • duration <= 90 sec • size <= 25 MiB"
+          echo "No YouTube cookies are used."
+          echo "============================================================"
+
+          yt-dlp \
+            --verbose \
+            --no-playlist \
+            --max-downloads 1 \
+            --max-filesize 25M \
+            --match-filter "duration <= 90" \
+            --newline \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --merge-output-format mp4 \
+            --format "bv*[height<=360]+ba/b[height<=360]/best[height<=360]/best" \
+            --output "output/%(title).120B [%(id)s].%(ext)s" \
+            "$VIDEO_URL" 2>&1 | tee yt-dlp-mobile-exit.log
+
+      - name: Show result
+        if: always()
+        shell: bash
+        run: |
+          echo "Downloaded files:"
+          find output -maxdepth 1 -type f -printf '%f (%s bytes)\n' 2>/dev/null || true
+
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-exit-test-log
+          path: |
+            yt-dlp-mobile-exit.log
+            mobile-exit-public-ip.txt
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Upload test video
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tubegrab-mobile-exit-video
+          path: output/*
+          if-no-files-found: error
+          retention-days: 1
