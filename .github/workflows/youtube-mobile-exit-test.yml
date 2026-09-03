@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Short public YouTube URL (90 sec max)"
+        description: 'Tiny PUBLIC YouTube video URL (prefer <= 60 sec)'
         required: true
         type: string
       exit_node:
-        description: "Tailscale exit-node machine name or Tailscale IP"
+        description: 'Tailscale exit-node device name'
         required: true
-        default: "tecno-spark-30c"
+        default: 'tecno-spark-30c'
         type: string
 
 permissions:
@@ -19,66 +19,76 @@ permissions:
 jobs:
   mobile-exit-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
 
     steps:
-      - name: Record GitHub runner public IP
+      - name: Record GitHub runner public IP BEFORE mobile routing
         shell: bash
         run: |
           set -euo pipefail
-          echo "GitHub runner public IP before Tailscale:"
-          curl -4 --fail --silent --show-error https://api.ipify.org
+          echo "GitHub runner public IP:"
+          curl -4 --fail --silent --show-error --max-time 10 https://api.ipify.org
           echo
 
-      - name: Connect runner to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          version: latest
-
-      - name: Route internet through phone exit node
-        shell: bash
-        env:
-          EXIT_NODE: ${{ inputs.exit_node }}
-        run: |
-          set -euo pipefail
-          echo "Tailnet status before selecting exit node:"
-          tailscale status
-          echo
-          echo "Selecting exit node: ${EXIT_NODE}"
-          sudo tailscale set --exit-node="${EXIT_NODE}" --exit-node-allow-lan-access=true
-          sleep 5
-          echo
-          echo "Tailnet status after selecting exit node:"
-          tailscale status
-          echo
-          echo "Public IP after exit-node routing:"
-          curl -4 --fail --silent --show-error https://api.ipify.org | tee mobile-exit-public-ip.txt
-          echo
-
+      # IMPORTANT: EVERYTHING HEAVY IS INSTALLED BEFORE TAILSCALE/EXIT-NODE ROUTING.
       - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: '22'
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install yt-dlp and FFmpeg
+      - name: Install yt-dlp BEFORE mobile routing
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install --upgrade "yt-dlp[default]"
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
-          echo "yt-dlp: $(yt-dlp --version)"
-          echo "Node: $(node --version)"
-          echo "FFmpeg: $(ffmpeg -version | head -n 1)"
+          yt-dlp --version
 
-      - name: Test one tiny 360p download over mobile exit node
+      - name: Ensure FFmpeg exists BEFORE mobile routing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+            echo "FFmpeg already present on GitHub runner. No download needed."
+            ffmpeg -version | head -n 1
+          else
+            echo "FFmpeg missing; installing now over GitHub runner network."
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+            ffmpeg -version | head -n 1
+          fi
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Route ONLY the test traffic through phone exit node
+        id: route
+        shell: bash
+        env:
+          EXIT_NODE: ${{ inputs.exit_node }}
+        run: |
+          set -euo pipefail
+          echo "Enabling exit node: $EXIT_NODE"
+          sudo tailscale set --exit-node="$EXIT_NODE" --exit-node-allow-lan-access=false
+
+          echo "Waiting briefly for route to settle..."
+          sleep 3
+
+          echo "Public IP AFTER mobile exit-node routing:"
+          MOBILE_IP="$(curl -4 --fail --silent --show-error --max-time 10 https://api.ipify.org)"
+          echo "$MOBILE_IP"
+          echo "mobile_ip=$MOBILE_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Test ONE tiny 360p YouTube download over mobile exit node
+        id: download
+        continue-on-error: true
         shell: bash
         env:
           VIDEO_URL: ${{ inputs.video_url }}
@@ -86,49 +96,60 @@ jobs:
           set -o pipefail
           mkdir -p output
 
-          echo "============================================================"
-          echo "TubeGrab mobile/residential exit-node test"
-          echo "One video only • 360p max • duration <= 90 sec • size <= 25 MiB"
-          echo "No YouTube cookies are used."
-          echo "============================================================"
+          echo "============================================================" | tee yt-dlp-mobile-test.log
+          echo "TubeGrab mobile-exit proof test" | tee -a yt-dlp-mobile-test.log
+          echo "Only this YouTube request/download is using the phone route." | tee -a yt-dlp-mobile-test.log
+          echo "Limits: <= 90 sec, <= 12 MiB, 360p max, 1 video." | tee -a yt-dlp-mobile-test.log
+          echo "============================================================" | tee -a yt-dlp-mobile-test.log
 
           yt-dlp \
             --verbose \
             --no-playlist \
-            --max-downloads 1 \
-            --max-filesize 25M \
-            --match-filter "duration <= 90" \
             --newline \
             --js-runtimes node \
             --remote-components ejs:github \
+            --match-filter "duration <= 90" \
+            --max-filesize 12M \
             --merge-output-format mp4 \
             --format "bv*[height<=360]+ba/b[height<=360]/best[height<=360]/best" \
-            --output "output/%(title).120B [%(id)s].%(ext)s" \
-            "$VIDEO_URL" 2>&1 | tee yt-dlp-mobile-exit.log
+            --output "output/%(title).100B [%(id)s].%(ext)s" \
+            "$VIDEO_URL" 2>&1 | tee -a yt-dlp-mobile-test.log
+
+      # CRITICAL: CUT OFF PHONE ROUTING BEFORE ANY OTHER NETWORK ACTIVITY.
+      - name: Disconnect Tailscale immediately after test
+        if: always()
+        shell: bash
+        run: |
+          echo "Disconnecting Tailscale now so later uploads use GitHub's network, not mobile data."
+          sudo tailscale down || true
+          sleep 2
+          echo "Public IP after disconnect (should be GitHub runner IP again):"
+          curl -4 --fail --silent --show-error --max-time 10 https://api.ipify.org || true
+          echo
 
       - name: Show result
         if: always()
         shell: bash
         run: |
+          echo "Mobile-routed public IP was: ${{ steps.route.outputs.mobile_ip }}"
+          echo "yt-dlp step result: ${{ steps.download.outcome }}"
           echo "Downloaded files:"
-          find output -maxdepth 1 -type f -printf '%f (%s bytes)\n' 2>/dev/null || true
+          find output -maxdepth 1 -type f -printf '%f  %s bytes\n' 2>/dev/null || true
 
       - name: Upload diagnostic log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mobile-exit-test-log
-          path: |
-            yt-dlp-mobile-exit.log
-            mobile-exit-public-ip.txt
-          if-no-files-found: ignore
+          name: yt-dlp-mobile-test-log
+          path: yt-dlp-mobile-test.log
+          if-no-files-found: warn
           retention-days: 1
 
-      - name: Upload test video
-        if: success()
+      - name: Upload test video if download succeeded
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tubegrab-mobile-exit-video
-          path: output/*
-          if-no-files-found: error
+          name: tubegrab-mobile-test-video
+          path: output/
+          if-no-files-found: ignore
           retention-days: 1
