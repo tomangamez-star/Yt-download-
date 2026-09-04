@@ -1,0 +1,94 @@
+name: TubeGrab Download Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: TubeGrab job UUID
+        required: true
+        type: string
+      url:
+        description: YouTube URL
+        required: true
+        type: string
+      type:
+        description: video or audio
+        required: true
+        default: video
+        type: choice
+        options: [video, audio]
+      quality:
+        description: Maximum video height
+        required: true
+        default: '720'
+        type: choice
+        options: ['360', '720', '1080']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tubegrab-worker
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install yt-dlp and FFmpeg
+        run: |
+          python -m pip install --upgrade 'yt-dlp[default]'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Create private authenticated cookie jar
+        shell: bash
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          set -euo pipefail
+          test -n "$YOUTUBE_COOKIES" || { echo 'YOUTUBE_COOKIES secret is empty'; exit 1; }
+          COOKIE_FILE="$RUNNER_TEMP/youtube-cookies.txt"
+          printf '%s' "$YOUTUBE_COOKIES" > "$COOKIE_FILE"
+          chmod 600 "$COOKIE_FILE"
+          echo "YOUTUBE_COOKIE_FILE=$COOKIE_FILE" >> "$GITHUB_ENV"
+
+      - name: Download and upload temporary media
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_BUCKET: tubegrab-temp
+          TUBEGRAB_JOB_ID: ${{ inputs.job_id }}
+          TUBEGRAB_URL: ${{ inputs.url }}
+          TUBEGRAB_TYPE: ${{ inputs.type }}
+          TUBEGRAB_QUALITY: ${{ inputs.quality }}
+        run: |
+          set -euo pipefail
+          python scripts/tubegrab_worker.py \
+            --job-id "$TUBEGRAB_JOB_ID" \
+            --url "$TUBEGRAB_URL" \
+            --type "$TUBEGRAB_TYPE" \
+            --quality "$TUBEGRAB_QUALITY" \
+            --max-file-mb 750 \
+            --max-duration-sec 7200 \
+            --output-dir "$RUNNER_TEMP/tubegrab-output"
+
+      - name: Remove authenticated cookie jar
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${YOUTUBE_COOKIE_FILE:-}" ]; then
+            rm -f "$YOUTUBE_COOKIE_FILE"
+          fi
+          echo 'Temporary authenticated cookie jar removed.'
