@@ -120,7 +120,7 @@ async function startDownload(video, type, quality) {
   saveButton.classList.add('hidden');
   downloadPanel.classList.remove('hidden');
   jobTitle.textContent = video.title;
-  jobPhase.textContent = 'Creating download job…';
+  jobPhase.textContent = 'Sending job to TubeGrab worker…';
   progressBar.style.width = '0%';
   progressText.textContent = '0%';
   speedText.textContent = '—';
@@ -146,26 +146,29 @@ async function pollJob(id) {
     progressText.textContent = `${percent}%`;
     speedText.textContent = job.speed || '—';
     etaText.textContent = job.eta ? `ETA ${job.eta}` : 'ETA —';
-    jobTitle.textContent = job.title || 'Preparing…';
+    jobTitle.textContent = job.title || jobTitle.textContent || 'Preparing…';
 
     const phaseText = {
-      queued: 'Queued — waiting for a download slot',
+      queued: 'Queued — waiting for GitHub worker',
+      starting: 'GitHub worker started…',
       preparing: 'Reading video information…',
       downloading: 'Downloading from YouTube…',
       processing: 'FFmpeg is processing the file…',
-      complete: 'Ready to save',
+      uploading: 'Uploading temporary file to TubeGrab storage…',
+      complete: 'Ready to save — temporary link expires soon',
       failed: job.error || 'Download failed',
+      expired: 'This temporary download has expired',
     };
-    jobPhase.textContent = phaseText[job.phase] || job.phase;
+    jobPhase.textContent = phaseText[job.phase] || job.phase || 'Working…';
 
     if (job.status === 'complete') {
       saveButton.href = `/api/jobs/${encodeURIComponent(id)}/file`;
       saveButton.classList.remove('hidden');
       return;
     }
-    if (job.status === 'failed') return;
+    if (job.status === 'failed' || job.status === 'expired') return;
 
-    pollTimer = setTimeout(() => pollJob(id), 900);
+    pollTimer = setTimeout(() => pollJob(id), 1500);
   } catch (error) {
     jobPhase.textContent = error.message;
   }
