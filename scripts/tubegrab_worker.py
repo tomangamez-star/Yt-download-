@@ -87,6 +87,14 @@ def run_download(args, output_dir):
     final_file = None
     last_progress_push = 0.0
     log_tail = []
+
+    # TubeGrab's progress bar represents the entire cloud pipeline, not just one
+    # yt-dlp stream. Video jobs commonly download a video stream and audio stream
+    # separately, so each stream gets its own slice of the 25–80% download range.
+    stream_index = 0
+    previous_raw_percent = None
+    highest_overall_progress = 25.0
+
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert process.stdout is not None
     for raw in process.stdout:
@@ -94,35 +102,84 @@ def run_download(args, output_dir):
         print(line, flush=True)
         log_tail.append(line)
         log_tail[:] = log_tail[-80:]
+
         if line.startswith('TITLE:'):
-            patch_job(args.job_id, title=line[6:].strip(), phase='downloading', status='running')
+            patch_job(
+                args.job_id,
+                title=line[6:].strip(),
+                phase='downloading',
+                status='running',
+                progress=max(highest_overall_progress, 25),
+            )
+
         elif line.startswith('FINAL_FILE:'):
             final_file = Path(line[len('FINAL_FILE:'):].strip())
+
         elif line.startswith('PROGRESS:'):
             parts = line[len('PROGRESS:'):].split('|')
             match = re.search(r'([0-9.]+)', parts[0] if parts else '')
             now = time.monotonic()
-            if match and (now - last_progress_push >= 1.5):
-                patch_job(
-                    args.job_id,
-                    status='running', phase='downloading',
-                    progress=float(match.group(1)),
-                    speed=(parts[1].strip() if len(parts) > 1 else None),
-                    eta=(parts[2].strip() if len(parts) > 2 else None),
-                )
-                last_progress_push = now
+
+            if match:
+                raw_percent = max(0.0, min(100.0, float(match.group(1))))
+
+                # yt-dlp resets to ~0 when it starts the second stream. Detect the
+                # reset so overall TubeGrab progress never jumps backwards.
+                if (
+                    args.type == 'video'
+                    and previous_raw_percent is not None
+                    and previous_raw_percent >= 70
+                    and raw_percent <= 30
+                    and stream_index == 0
+                ):
+                    stream_index = 1
+
+                previous_raw_percent = raw_percent
+
+                if args.type == 'video':
+                    if stream_index == 0:
+                        overall = 25.0 + (raw_percent / 100.0) * 30.0   # 25 → 55
+                    else:
+                        overall = 55.0 + (raw_percent / 100.0) * 25.0   # 55 → 80
+                else:
+                    overall = 25.0 + (raw_percent / 100.0) * 55.0       # 25 → 80
+
+                highest_overall_progress = max(highest_overall_progress, overall)
+
+                if now - last_progress_push >= 1.2 or raw_percent >= 99.9:
+                    patch_job(
+                        args.job_id,
+                        status='running',
+                        phase='downloading',
+                        progress=round(highest_overall_progress, 1),
+                        speed=(parts[1].strip() if len(parts) > 1 else None),
+                        eta=(parts[2].strip() if len(parts) > 2 else None),
+                    )
+                    last_progress_push = now
+
         elif any(marker in line for marker in ('[Merger]', '[ExtractAudio]', '[VideoRemuxer]', '[Fixup')):
-            patch_job(args.job_id, status='running', phase='processing')
+            highest_overall_progress = max(highest_overall_progress, 88)
+            patch_job(
+                args.job_id,
+                status='running',
+                phase='processing',
+                progress=88,
+                speed=None,
+                eta=None,
+            )
 
     code = process.wait()
     if code != 0:
         raise RuntimeError('\n'.join(log_tail))
+
     if final_file is None or not final_file.exists():
         candidates = [p for p in output_dir.iterdir() if p.is_file() and not p.name.endswith('.part')]
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         final_file = candidates[0] if candidates else None
+
     if final_file is None or not final_file.exists():
         raise RuntimeError('yt-dlp completed but produced no final file')
+
     return final_file
 
 
@@ -132,6 +189,7 @@ def upload_file(job_id, file_path):
     encoded = '/'.join(urllib.parse.quote(part, safe='') for part in object_path.split('/'))
     content_type = mimetypes.guess_type(file_path.name)[0] or 'application/octet-stream'
     endpoint = f'{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(BUCKET, safe="")}/{encoded}'
+
     cmd = [
         'curl', '--fail', '--silent', '--show-error', '-X', 'POST', endpoint,
         '-H', f'apikey: {SERVICE_KEY}',
@@ -154,44 +212,114 @@ def main():
     parser.add_argument('--max-file-mb', type=int, default=750)
     parser.add_argument('--max-duration-sec', type=int, default=7200)
     args = parser.parse_args()
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        patch_job(args.job_id, status='running', phase='starting', progress=0, error=None)
+        # 12% means a real GitHub runner exists and the worker script is executing.
+        patch_job(
+            args.job_id,
+            status='running',
+            phase='starting',
+            progress=12,
+            error=None,
+            speed=None,
+            eta=None,
+        )
 
         # Metadata check uses the same authenticated session as the real download.
+        patch_job(
+            args.job_id,
+            status='running',
+            phase='preparing',
+            progress=20,
+            speed=None,
+            eta=None,
+        )
+
         meta_cmd = [
             'yt-dlp', '--js-runtimes', 'node', '--remote-components', 'ejs:github',
-            '--cookies', COOKIE_FILE, '--dump-single-json', '--skip-download', '--no-playlist', '--no-warnings', args.url,
+            '--cookies', COOKIE_FILE,
+            '--dump-single-json', '--skip-download', '--no-playlist', '--no-warnings',
+            args.url,
         ]
         meta = json.loads(subprocess.check_output(meta_cmd, text=True, stderr=subprocess.STDOUT))
+
         title = meta.get('title') or 'YouTube download'
         duration = meta.get('duration')
+
         if meta.get('is_live') or meta.get('live_status') == 'is_live':
             raise RuntimeError('LIVE_STREAM_NOT_SUPPORTED')
         if duration and float(duration) > args.max_duration_sec:
             raise RuntimeError('VIDEO_TOO_LONG')
-        patch_job(args.job_id, title=title, status='running', phase='preparing')
+
+        patch_job(
+            args.job_id,
+            title=title,
+            status='running',
+            phase='preparing',
+            progress=23,
+        )
 
         final_file = run_download(args, output_dir)
         size = final_file.stat().st_size
+
         if size > args.max_file_mb * 1024 * 1024:
             raise RuntimeError('OUTPUT_TOO_LARGE')
 
-        patch_job(args.job_id, status='running', phase='uploading', progress=100, speed=None, eta=None)
+        # yt-dlp may not emit a merger/extractor line for every format. Force the
+        # pipeline to a real post-download milestone before storage upload.
+        patch_job(
+            args.job_id,
+            status='running',
+            phase='processing',
+            progress=90,
+            speed=None,
+            eta=None,
+        )
+
+        patch_job(
+            args.job_id,
+            status='running',
+            phase='uploading',
+            progress=94,
+            speed=None,
+            eta=None,
+        )
+
         object_path = upload_file(args.job_id, final_file)
+
+        patch_job(
+            args.job_id,
+            status='running',
+            phase='uploading',
+            progress=98,
+            speed=None,
+            eta=None,
+        )
+
         expires = datetime.now(timezone.utc) + timedelta(hours=2)
         patch_job(
             args.job_id,
-            status='complete', phase='complete', progress=100,
-            object_path=object_path, file_name=final_file.name, file_size=size,
-            expires_at=expires.isoformat(), speed=None, eta=None, error=None,
+            status='complete',
+            phase='complete',
+            progress=100,
+            object_path=object_path,
+            file_name=final_file.name,
+            file_size=size,
+            expires_at=expires.isoformat(),
+            speed=None,
+            eta=None,
+            error=None,
         )
+
         print(f'TUBEGAB_SUCCESS object={object_path} bytes={size}', flush=True)
+
     except Exception as exc:
         message = str(exc)
         print(f'TUBEGAB_FAILURE: {message}', file=sys.stderr, flush=True)
+
         if message == 'VIDEO_TOO_LONG':
             public = f'Video is longer than TubeGrab\'s {round(args.max_duration_sec / 60)} minute limit.'
         elif message == 'LIVE_STREAM_NOT_SUPPORTED':
@@ -200,10 +328,19 @@ def main():
             public = f'The finished file exceeded TubeGrab\'s {args.max_file_mb} MB limit.'
         else:
             public = safe_error(message)
+
         try:
-            patch_job(args.job_id, status='failed', phase='failed', error=public, speed=None, eta=None)
+            patch_job(
+                args.job_id,
+                status='failed',
+                phase='failed',
+                error=public,
+                speed=None,
+                eta=None,
+            )
         except Exception as patch_exc:
             print(f'Could not update failed job: {patch_exc}', file=sys.stderr)
+
         raise
 
 
